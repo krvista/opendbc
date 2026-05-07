@@ -4,6 +4,7 @@ from enum import IntFlag
 
 from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms, uds
 from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.lateral import AngleSteeringLimits
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarHarness, CarDocs, CarParts, SupportType
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, p16
@@ -16,6 +17,55 @@ Ecu = CarParams.Ecu
 class CarControllerParams:
   ACCEL_MIN = -3.5 # m/s
   ACCEL_MAX = 2.0 # m/s
+
+  # Angle-based control limits for the HDA2-ALT + CCNC angle-control
+  # platform (HyundaiFlags.CCNC | HyundaiFlags.CANFD_LKA_STEER_MSG_ALT).
+  # Ioniq 6 N 2026 is the first member.
+  ANGLE_LIMITS_VM: AngleSteeringLimits = AngleSteeringLimits(
+    360,
+    ([], []),
+    ([], []),
+    MAX_LATERAL_ACCEL=3.0 + (9.81 * 0.06),
+    MAX_LATERAL_JERK=3.0 + (9.81 * 0.06),
+    MAX_ANGLE_RATE=5.0,
+  )
+
+  ANGLE_RATE_BP = [0., 7., 11., 17., 23., 30.]
+  ANGLE_RATE_V  = [2.5, 2.5, 2.5, 2.3, 2.3, 1.5]
+
+  # Variable-tau LPF for CCNC angle steering.
+  VTAU_ANGLE_BP = [0.0, 1.0, 3.0, 10.0]
+  VTAU_ANGLE_V  = [2.5, 0.4, 0.20, 0.20]
+  VTAU_SPEED_BP = [0.0, 3.0, 5.0, 15.0]
+  VTAU_SPEED_V  = [0.5, 0.3, 0.20, 0.0]
+  VTAU_ENTRY_TH_BP = [4.0, 15.0, 25.0]
+  VTAU_ENTRY_TH_V  = [0.3, 0.7, 1.5]
+  VTAU_EXIT_TH  = 0.3
+
+  # ACIGain rate limit / quantization for CCNC angle steering.
+  ACI_GAIN_RATE_DOWN = -0.014
+  ACI_GAIN_RATE_UP   =  0.004
+  ACI_GAIN_QUANT     =  0.004
+  ACI_GAIN_CEILING   =  1.0
+
+  # Driver-override thresholds for torque-control CANFD cars.
+  DRIVER_TORQUE_DEADZONE = 25.0
+  DRIVER_TORQUE_FULL_OVERRIDE_LOW_V  = 60.0
+  DRIVER_TORQUE_FULL_OVERRIDE_HIGH_V = 120.0
+  DRIVER_TORQUE_LOW_V_SPEED  = 8.0
+  DRIVER_TORQUE_HIGH_V_SPEED = 15.0
+
+  # Driver-override thresholds for CCNC angle-control. The MDPS reports
+  # STEERING_COL_TORQUE that includes EPS reaction during angle tracking,
+  # not just driver input — so thresholds are higher.
+  DRIVER_TORQUE_DEADZONE_ANGLE              = 200.0
+  DRIVER_TORQUE_FULL_OVERRIDE_LOW_V_ANGLE   = 450.0
+  DRIVER_TORQUE_FULL_OVERRIDE_HIGH_V_ANGLE  = 600.0
+
+  OVERRIDE_SNAP_ENTER_FACTOR = 0.95
+  OVERRIDE_SNAP_ENTER_FRAMES = 3
+  OVERRIDE_SNAP_EXIT_FACTOR  = 0.10
+  OVERRIDE_SNAP_EXIT_FRAMES  = 15
 
   def __init__(self, CP):
     self.STEER_DELTA_UP = 3
@@ -33,6 +83,10 @@ class CarControllerParams:
       self.STEER_THRESHOLD = 250
       self.STEER_DELTA_UP = 2
       self.STEER_DELTA_DOWN = 3
+      if CP.flags & HyundaiFlags.CCNC:
+        self.STEER_STEP = 1
+        self.ANGLE_LIMITS = CarControllerParams.ANGLE_LIMITS_VM
+        self.STEER_THRESHOLD = 350
 
     # To determine the limit for your car, find the maximum value that the stock LKAS will request.
     # If the max stock LKAS request is <384, add your car to this list.
@@ -68,6 +122,7 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEER_MSG_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CCNC = 1024
 
 
 # Hyundai/Kia/Genesis SCC (Smart Cruise Control) and steering architecture:
@@ -148,6 +203,15 @@ class HyundaiFlags(IntFlag):
   FCEV = 2 ** 25
 
   ALT_LIMITS_2 = 2 ** 26
+
+  # CCNC dash cluster (HDA2-ALT). Combined with CANFD_LKA_STEER_MSG_ALT,
+  # openpilot uses LKAS_ALT angle control via ADAS_StrAnglReqVal.
+  # Ioniq 6 N 2026 is the first member.
+  CCNC = 2 ** 27
+
+  # Some CCNC platforms publish doors/blinkers on a different message —
+  # see hyundaicanfd.py CarState parsing. Used by Ioniq 6 N.
+  CANFD_ALT_DOORS_BLINKERS = 2 ** 28
 
 
 @dataclass
@@ -387,6 +451,11 @@ class CAR(Platforms):
     [HyundaiCarDocs("Hyundai Ioniq 6 (with HDA II) 2023-24", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_p]))],
     HYUNDAI_IONIQ_5.specs,
     flags=HyundaiFlags.EV | HyundaiFlags.CANFD_NO_RADAR_DISABLE,
+  )
+  HYUNDAI_IONIQ_6_N = HyundaiCanFDPlatformConfig(
+    [HyundaiCarDocs("Hyundai Ioniq 6 N (with HDA II) 2026", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_s]))],
+    CarSpecs(mass=2175, wheelbase=2.965, steerRatio=14.96, tireStiffnessFactor=1.15),
+    flags=HyundaiFlags.EV | HyundaiFlags.CANFD_NO_RADAR_DISABLE | HyundaiFlags.CCNC | HyundaiFlags.CANFD_ALT_BUTTONS | HyundaiFlags.CANFD_ALT_DOORS_BLINKERS,
   )
   HYUNDAI_TUCSON_4TH_GEN = HyundaiCanFDPlatformConfig(
     [
@@ -863,6 +932,8 @@ CAN_GEARS = {
 }
 
 CANFD_CAR = CAR.with_flags(HyundaiFlags.CANFD)
+
+CANFD_UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.CANFD_NO_RADAR_DISABLE)
 
 CAMERA_SCC_CAR = CAR.with_flags(HyundaiFlags.CAMERA_SCC)
 

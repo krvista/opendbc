@@ -64,6 +64,9 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     self.buttons_counter = 0
 
     self.cruise_info = {}
+    self.msg_161, self.msg_162, self.msg_1b5 = {}, {}, {}
+    self.fault_lfa = 0
+    self.fault_das = 0
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -235,8 +238,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     ret.brakePressed = cp.vl["TCS"]["DriverBraking"] == 1
 
-    ret.doorOpen = cp.vl["DOORS_SEATBELTS"]["DRIVER_DOOR"] == 1
-    ret.seatbeltUnlatched = cp.vl["DOORS_SEATBELTS"]["DRIVER_SEATBELT"] == 0
+    if self.CP.flags & HyundaiFlags.CANFD_ALT_DOORS_BLINKERS:
+      ret.doorOpen = any([cp.vl["DOORS_ALT"]["DRIVER_DOOR"], cp.vl["DOORS_ALT"]["PASSENGER_DOOR"],
+                          cp.vl["DOORS_ALT"]["DRIVER_REAR_DOOR"], cp.vl["DOORS_ALT"]["PASSENGER_REAR_DOOR"]])
+      ret.seatbeltUnlatched = cp.vl["DOORS_SEATBELTS_ALT"]["DRIVER_SEATBELT"] == 0
+    else:
+      ret.doorOpen = cp.vl["DOORS_SEATBELTS"]["DRIVER_DOOR"] == 1
+      ret.seatbeltUnlatched = cp.vl["DOORS_SEATBELTS"]["DRIVER_SEATBELT"] == 0
 
     gear = cp.vl[self.gear_msg_canfd]["GEAR"]
     ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(gear))
@@ -253,20 +261,49 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEERING_RATE"]
     ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"]
-    ret.steeringTorque = cp.vl["MDPS"]["MDPS_StrTqSnsrVal"]
-    ret.steeringTorqueEps = cp.vl["MDPS"]["MDPS_OutTqVal"]
+    ret.steeringTorque = cp.vl["MDPS"]["STEERING_COL_TORQUE"]
+    ret.steeringTorqueEps = cp.vl["MDPS"]["STEERING_OUT_TORQUE"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
-    ret.steerFaultTemporary = cp.vl["MDPS"]["MDPS_LkaFailSta"] != 0
+    ret.steerFaultTemporary = cp.vl["MDPS"]["LKA_FAULT"] != 0
 
-    # TODO: alt signal usage may be described by cp.vl['BLINKERS']['USE_ALT_LAMP']
-    left_blinker_sig, right_blinker_sig = "LEFT_LAMP", "RIGHT_LAMP"
-    if self.CP.carFingerprint == CAR.HYUNDAI_KONA_EV_2ND_GEN:
-      left_blinker_sig, right_blinker_sig = "LEFT_LAMP_ALT", "RIGHT_LAMP_ALT"
-    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS"][left_blinker_sig],
-                                                                      cp.vl["BLINKERS"][right_blinker_sig])
+    alt = ""
+    if self.CP.flags & HyundaiFlags.CCNC:
+      alt = "_ALT"
+      # Capture CCNC messages for later re-publication (non-HDA2 path,
+      # `create_ccnc` in carcontroller). On non-HDA2 CCNC cars these three
+      # messages are forwarded from the camera bus, so we read them via
+      # `cp_cam` (bus 2).
+      #
+      # NOTE: on the HDA2-ALT + CCNC angle-control platform (Ioniq 6 N
+      # 2026 and future CCNC | CANFD_LKA_STEERING_ALT cars), CCNC_0x161,
+      # CCNC_0x162, and FR_CMR_03_50ms are natively published by a
+      # gateway ECU on bus 1 (ECAN), NOT forwarded from the camera bus.
+      # Accessing `cp_cam.vl["CCNC_0x161"]` there auto-registers the
+      # message on the cam parser's validation set (VLDict behaviour in
+      # opendbc/can/parser.py); because it never arrives on bus 2, the
+      # parser's `can_valid` goes False within ~10 s → CarState.canValid
+      # False → `canError` event → "Unknown Vehicle Variant" alert +
+      # controls disabled (fault cascade observed in route 00000030
+      # 2026-04-15: 100 % of 23,511 carState frames had canValid=False).
+      #
+      # The alert-suppression feature that originally motivated capturing
+      # these messages on HDA2-ALT (commit 81c451f) has since been
+      # disabled in carcontroller because the native bus-1 publisher
+      # cannot be silenced, so any TX from openpilot creates a
+      # dual-publisher fault visible as ADAS icon flicker. We therefore
+      # simply skip the capture on HDA2-ALT entirely.
+      if not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
+        self.msg_161, self.msg_162, self.msg_1b5 = map(copy.copy, (cp_cam.vl["CCNC_0x161"], cp_cam.vl["CCNC_0x162"], cp_cam.vl["FR_CMR_03_50ms"]))
+        self.cruise_info = copy.copy((cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp).vl["SCC_CONTROL"])
+    if self.CP.flags & HyundaiFlags.CANFD_ALT_DOORS_BLINKERS:
+      ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS_ALT"]["LEFT_LAMP"],
+                                                                        cp.vl["BLINKERS_ALT"]["RIGHT_LAMP"])
+    else:
+      ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS"][f"LEFT_LAMP{alt}"],
+                                                                        cp.vl["BLINKERS"][f"RIGHT_LAMP{alt}"])
     if self.CP.enableBsm:
-      ret.leftBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_LtIndSta"])
-      ret.rightBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_RtIndSta"])
+      ret.leftBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"][f"FL_INDICATOR{alt}"] != 0
+      ret.rightBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"][f"FR_INDICATOR{alt}"] != 0
 
     # cruise state
     # CAN FD cars enable on main button press, set available if no TCS faults preventing engagement
@@ -302,6 +339,17 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       self.lfa_block_msg = copy.copy(cp_cam.vl["CAM_0x362"] if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT
                                           else cp_cam.vl["CAM_0x2a4"])
 
+    # For the HDA2-ALT + CCNC angle-control platform (CCNC |
+    # CANFD_LKA_STEERING_ALT), capture the camera's native LKAS_ALT so
+    # carcontroller can pass its bits through unchanged except for the
+    # angle command. This preserves camera-native fields (LKA_AVAILABLE,
+    # LFA_BUTTON, LKA_ICON, and the hidden-nibble validation bits at
+    # byte 9) that ADAS DRV uses to authenticate the LKAS_ALT message
+    # as a legitimate camera command and activate its LFA processing
+    # pipeline rather than falling back to LKA.
+    if (self.CP.flags & HyundaiFlags.CCNC) and (self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT):
+      self.lkas_alt_cam_msg = copy.copy(cp_cam.vl["LKAS_ALT"])
+
     MadsCarState.update_mads_canfd(self, ret, can_parsers)
 
     ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
@@ -310,6 +358,11 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     if self.CP.openpilotLongitudinalControl:
       ret.cruiseState.available = self.get_main_cruise(ret)
+
+    if (self.CP.flags & HyundaiFlags.CCNC) and (self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT):
+      ccnc_162 = cp.vl["CCNC_0x162"]
+      self.fault_lfa = int(ccnc_162["FAULT_LFA"])
+      self.fault_das = int(ccnc_162["FAULT_DAS"])
 
     CarStateExt.update_canfd_ext(self, ret, ret_sp, can_parsers, speed_factor)
 
@@ -325,10 +378,30 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
-    return {
+
+    # CCNC cars (Ioniq 5 N, Ioniq 6 N, etc.): ACCELERATOR and MANUAL_SPEED_LIMIT_ASSIST
+    # use +2 counter increment instead of +1, causing counter validation failure.
+    # Register them here so we can disable counter checking before CarState accesses them.
+    if CP.flags & HyundaiFlags.CCNC:
+      msgs += [("ACCELERATOR", 50), ("MANUAL_SPEED_LIMIT_ASSIST", 5)]
+      if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT:
+        msgs += [("CCNC_0x162", 20)]
+
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
     }
+
+    if CP.flags & HyundaiFlags.CCNC:
+      skip_addrs = [0x35, 0x2E0]  # ACCELERATOR, MANUAL_SPEED_LIMIT_ASSIST
+      if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT:
+        skip_addrs.append(0x162)  # CCNC_0x162
+      for addr in skip_addrs:
+        if addr in parsers[Bus.pt].message_states:
+          parsers[Bus.pt].message_states[addr].ignore_counter = True
+          parsers[Bus.pt].message_states[addr].ignore_alive = True
+
+    return parsers
 
   def get_can_parsers(self, CP, CP_SP):
     if CP.flags & HyundaiFlags.CANFD:
